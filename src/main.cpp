@@ -1,19 +1,364 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <PubSubClient.h>
 #include "wifi_secrets.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 #include "UltrasonicSensor.h"
 #include "AutomaticBraking.h"
-BLEClient* train1Client = nullptr;
-BLEClient* train2Client = nullptr;
-BLEClient* train3Client = nullptr;
 
-BLERemoteCharacteristic* train1Control = nullptr;
-BLERemoteCharacteristic* train2Control = nullptr;
-BLERemoteCharacteristic* train3Control = nullptr;
+
+
+const unsigned long ACCEL_INTERVAL = 200;
+const int ACCEL_STEP = 5;
+
+const unsigned long BRAKE_INTERVAL = 200;
+const int BRAKE_STEP = 5;
+
+const int SMOOTH_START_SPEED = 30;
+
+constexpr size_t trainAmount = 1; // max 3
+constexpr char* MacAddresses[3] = {"9c:9a:c0:4a:8b:b9", "9c:9a:c0:33:9f:eb","9c:9a:c0:4b:fd:20"};
+
+constexpr char MQTT_HOST[] = "192.168.1.125";
+constexpr uint16_t MQTT_PORT = 1883;
+constexpr char* MQTT_LOCO_ID[3] = {"Train1", "Train2", "Train3"};
+constexpr char MQTT_COMMAND_TOPIC[] = "rocrail/service/command";
+constexpr bool MQTT_COMMANDS_ENABLED = true;
+
+WiFiClient mqttWifiClient;
+PubSubClient mqtt(mqttWifiClient);
+unsigned long lastMqttTry = 0;
+bool wasMqttConnected = false;
+
+//for tests 
+unsigned long lastDistanceMeasurement = 0;
+const unsigned long DISTANCE_INTERVAL = 100;
+
+
+void legoNotificationCallback(
+    BLERemoteCharacteristic* characteristic,
+    uint8_t* data,
+    size_t length,
+    bool isNotify)
+{
+    Serial.print("LEGO Hub response: ");
+
+    for (size_t i = 0; i < length; i++)
+    {
+        Serial.printf("%02X ", data[i]);
+    }
+
+    Serial.println();
+}
+
+
+
+class Train
+{
+public:
+    BLEClient* TrainClient = nullptr;
+    BLERemoteCharacteristic* TrainControl = nullptr;
+
+    const int trainID = 1;
+    const String locoID = "";
+    int TrainSpeed = 0;
+    bool TrainRunning = false;
+    bool TrainBraking = false;
+    bool TrainAccelerating = false;
+    unsigned long TrainBrakeTime = 0;
+    int TrainTargetSpeed = 0;
+    unsigned long TrainAccelTime = 0;
+
+    Train(const int ID) : trainID(ID) {}
+    Train(const int ID, const String& loco_id) : trainID(ID), locoID(loco_id) {}
+
+    void setMotorSpeed(int8_t speed)
+    {
+        if (TrainControl == nullptr)
+        {
+            Serial.println("Train control not available!");
+            return;
+        }
+
+        if (TrainClient == nullptr)
+        {
+            Serial.println("Train client not available!");
+            return;
+        }
+
+        // Check BLE connection
+        if (!TrainClient->isConnected())
+        {
+            Serial.println("BLE disconnected! Motor command not sent!");
+            return;
+        }
+
+        // LEGO Powered Up motor command
+        uint8_t command[] = 
+        {
+            0x08,
+            0x00,
+            0x81,
+            0x00,
+            0x10,
+            0x51,
+            0x00,
+            (uint8_t)speed
+        };
+
+        // Send command to LEGO Hub
+        TrainControl->writeValue(command, sizeof(command), false);
+
+        // Remember last commanded motor power
+        TrainSpeed = speed;
+        TrainRunning = (speed != 0);
+    }
+
+    // -
+    
+    void smoothStart(int targetSpeed)
+    {
+        if (TrainControl == nullptr)
+        {
+            Serial.println("Train not connected!");
+            return;
+        }
+
+  
+        if (isObstacleDetected(trainID))
+            return;
+
+        TrainBraking = false;
+        TrainTargetSpeed = targetSpeed;
+        TrainAccelerating = (TrainSpeed != targetSpeed);
+        TrainAccelTime = millis();
+        TrainRunning = (targetSpeed != 0 || TrainSpeed != 0);
+    }
+
+    // -
+
+    void smoothStop()
+    {
+        if (TrainControl == nullptr)
+        {
+            Serial.println("Train not connected!");
+            return;
+        }
+
+       
+        TrainAccelerating = false;
+        TrainBraking = (TrainSpeed != 0);
+        TrainBrakeTime = millis();
+
+        if (!TrainBraking)
+        {
+            TrainRunning = false;
+        }
+    }
+
+    // -
+
+    void reverse()
+    {
+        TrainAccelerating = false;
+        TrainBraking = false;
+        setMotorSpeed(0);
+        delay(500);
+        setMotorSpeed(-20);
+    }
+
+    // -
+
+    void updateAcceleration()
+    {
+        if (TrainControl == nullptr)
+        {
+            Serial.println("Train control not available!");
+            return;
+        }
+
+        unsigned long now = millis();
+
+        if (TrainAccelerating && now - TrainAccelTime >= ACCEL_INTERVAL)
+        {
+            TrainAccelTime = now;
+
+            int speed = TrainSpeed;
+
+            if (speed < TrainTargetSpeed)
+            {
+                speed = min(speed + ACCEL_STEP, TrainTargetSpeed);
+            }
+            else
+            {
+                speed = max(speed - ACCEL_STEP, TrainTargetSpeed);
+            }
+
+            setMotorSpeed(speed);
+
+            if (speed == TrainTargetSpeed)
+            {
+                TrainAccelerating = false;
+                Serial.printf("Train %d reached target power!\n", trainID);
+            }
+        }
+
+    }
+
+    // -
+
+    void updateBraking()
+    {
+        unsigned long now = millis();
+
+        if (TrainBraking && now - TrainBrakeTime >= BRAKE_INTERVAL)
+        {
+            TrainBrakeTime = now;
+
+            int speed = TrainSpeed;
+
+            if (speed > 0)
+            {
+                speed = max(0, speed - BRAKE_STEP);
+            }
+            else
+            {
+                speed = min(0, speed + BRAKE_STEP);
+            }
+
+            setMotorSpeed(speed);
+
+            if (speed == 0)
+            {
+                TrainBraking = false;
+                TrainRunning = false;
+                Serial.printf("Train %d smoothly stopped!\n", trainID);
+            }
+        }
+    }
+
+    // -
+
+    void setLights(uint8_t brightness){
+
+        if (TrainControl == nullptr) 
+        {
+            Serial.println("Train not connected!");
+            return;
+        }
+
+        uint8_t command[] = {
+            0x08,
+            0x00,
+            0x81,
+            0x01,
+            0x10,
+            0x51,
+            0x00,
+            brightness
+        };
+
+        TrainControl->writeValue(command, sizeof(command), false);
+    }
+
+    // -
+
+    void cleanup()
+    {
+        TrainControl = nullptr;
+
+        if (TrainClient != nullptr && TrainClient->isConnected())
+        {
+            TrainClient->disconnect();
+        }
+
+        TrainSpeed = 0;
+        TrainRunning = false;
+        TrainBraking = false;
+        TrainAccelerating = false;
+        TrainBrakeTime = 0;
+        TrainTargetSpeed = 0;
+        TrainAccelTime = 0;
+    }
+
+    // -
+
+    bool connectToLEGOHub(const char* address)
+    {
+        if (TrainClient != nullptr && TrainClient->isConnected() && TrainControl != nullptr)
+        {
+            Serial.println("Train already connected!");
+            return false;
+        }
+
+        cleanup();
+
+        Serial.print("Connecting to LEGO Hub: ");
+        Serial.println(address);
+
+        if (TrainClient == nullptr)
+        {
+            TrainClient = BLEDevice::createClient();
+        }
+
+        if (TrainClient == nullptr)
+        {
+            Serial.println("Failed to create BLE client!");
+            return false;
+        }
+
+        BLEAddress hubAddress(address);
+
+        if (!TrainClient->connect(hubAddress)) 
+        {
+            Serial.println("BLE connection failed!");
+            cleanup();
+            return false;
+        }
+
+        Serial.println("BLE connected!");
+
+        BLEUUID serviceUUID("00001623-1212-efde-1623-785feabcd123");
+
+        BLERemoteService* service = TrainClient->getService(serviceUUID);
+
+        if (service == nullptr) 
+        {
+            Serial.println("LEGO service not found!");
+            cleanup();
+            return false;
+        }
+
+        BLEUUID characteristicUUID("00001624-1212-efde-1623-785feabcd123");
+
+        BLERemoteCharacteristic* characteristic = service->getCharacteristic(characteristicUUID);
+
+        if (characteristic == nullptr || !characteristic->canWrite()) 
+        {
+            Serial.println("LEGO control not available!");
+            cleanup();
+            return false;
+        }
+
+        TrainControl = characteristic;
+
+        if (TrainControl->canNotify()) 
+        {
+            TrainControl->registerForNotify(legoNotificationCallback);
+        }
+
+        Serial.println("LEGO Hub ready!");
+        return true;
+    }
+
+    // -
+};
+
+Train* trains[trainAmount] = {};
+
 
 void scanLEGOHub()
 {
@@ -35,489 +380,70 @@ void scanLEGOHub()
 
     scanner->clearResults();
 }
-void legoNotificationCallback(
-    BLERemoteCharacteristic* characteristic,
-    uint8_t* data,
-    size_t length,
-    bool isNotify)
+
+void InitSerial()
 {
-    Serial.print("LEGO Hub response: ");
-
-    for (size_t i = 0; i < length; i++)
-    {
-        Serial.printf("%02X ", data[i]);
-    }
-
-    Serial.println();
-}
-
-bool connectToLEGOHub(
-    const char* address,
-    BLEClient*& client,
-    BLERemoteCharacteristic*& control){
-
-    Serial.print("Connecting to LEGO Hub: ");
-    Serial.println(address);
-
-    control = nullptr;
-
-    client = BLEDevice::createClient();
-    BLEAddress hubAddress(address);
-
-    if (!client->connect(hubAddress)) {
-        Serial.println("BLE connection failed!");
-        return false;
-    }
-
-    Serial.println("BLE connected!");
-
-    BLEUUID serviceUUID(
-        "00001623-1212-efde-1623-785feabcd123"
-    );
-
-    BLERemoteService* service =
-        client->getService(serviceUUID);
-
-    if (service == nullptr) {
-        Serial.println("LEGO service not found!");
-        client->disconnect();
-        return false;
-    }
-
-    BLEUUID characteristicUUID(
-        "00001624-1212-efde-1623-785feabcd123"
-    );
-
-    BLERemoteCharacteristic* characteristic =
-        service->getCharacteristic(characteristicUUID);
-
-    if (characteristic == nullptr ||
-        !characteristic->canWrite()) {
-        Serial.println("LEGO control not available!");
-        client->disconnect();
-        return false;
-    }
-
-    control = characteristic;
-
-    if (control->canNotify()) {
-        control->registerForNotify(
-            legoNotificationCallback
-        );
-    }
-
-    Serial.println("LEGO Hub ready!");
-    return true;
-}
-unsigned long motorStopTime = 0;
-bool motorRunning = false;
-int train1Speed = 0;
-const unsigned long MOTOR_TIMEOUT = 10000;
-
-unsigned long train2StopTime = 0;
-bool train2Running = false;
-int train2Speed = 0;
-bool train1Braking = false;
-bool train2Braking = false;
-
-unsigned long train1BrakeTime = 0;
-unsigned long train2BrakeTime = 0;
-bool train1Accelerating = false;
-bool train2Accelerating = false;
-
-int train1TargetSpeed = 0;
-int train2TargetSpeed = 0;
-
-unsigned long train1AccelTime = 0;
-unsigned long train2AccelTime = 0;
-
-const unsigned long ACCEL_INTERVAL = 200;
-const int ACCEL_STEP = 5;
-
-const unsigned long BRAKE_INTERVAL = 200;
-const int BRAKE_STEP = 5;
-
-unsigned long train3StopTime = 0;
-bool train3Running = false;
-int train3Speed = 0;
-
-bool train3Braking = false;
-unsigned long train3BrakeTime = 0;
-
-bool train3Accelerating = false;
-int train3TargetSpeed = 0;
-unsigned long train3AccelTime = 0;
-
-
-void setMotorSpeed(
-    BLERemoteCharacteristic* control,
-    int8_t speed){
-
-    if (control == nullptr)
-    {
-        Serial.println("Train control not available!");
-        return;
-    }
-
-    // Identify which train we are controlling
-    BLEClient* client = nullptr;
-
-    if (control == train1Control)
-    {
-        client = train1Client;
-    }
-    else if (control == train2Control)
-    {
-        client = train2Client;
-    }
-    else if (control == train3Control)
-    {
-        client = train3Client;
-    }
-    else
-    {
-        Serial.println("Unknown train control!");
-        return;
-    }
-
-    // Check BLE connection
-    if (client == nullptr || !client->isConnected())
-    {
-        Serial.println("BLE disconnected! Motor command not sent!");
-        return;
-    }
-
-    // LEGO Powered Up motor command
-    uint8_t command[] = {
-        0x08,
-        0x00,
-        0x81,
-        0x00,
-        0x10,
-        0x51,
-        0x00,
-        (uint8_t)speed
-    };
-
-    // Send command to LEGO Hub
-    control->writeValue(
-        command,
-        sizeof(command),
-        false
-    );
-
-    // Remember last commanded motor power
-    if (control == train1Control)
-    {
-        train1Speed = speed;
-    }
-    else if (control == train2Control)
-    {
-        train2Speed = speed;
-    }
-    else if (control == train3Control)
-    {
-        train3Speed = speed;
-    }
-}
-
-
-
-void smoothStart(
-    BLERemoteCharacteristic* control,
-    int targetSpeed)
-{
-    if (control == nullptr)
-    {
-        Serial.println("Train not connected!");
-        return;
-    }
-
-    if (control == train1Control)
-    {
-        if (isObstacleDetected(1))
-            return;
-
-        train1Braking = false;
-        train1TargetSpeed = targetSpeed;
-        train1Accelerating = (train1Speed != targetSpeed);
-        train1AccelTime = millis();
-    }
-    else if (control == train2Control)
-    {
-        if (isObstacleDetected(2))
-            return;
-
-        train2Braking = false;
-        train2TargetSpeed = targetSpeed;
-        train2Accelerating = (train2Speed != targetSpeed);
-        train2AccelTime = millis();
-    }
-    else if (control == train3Control)
-    {
-        if (isObstacleDetected(3))
-            return;
-
-        train3Braking = false;
-        train3TargetSpeed = targetSpeed;
-        train3Accelerating = (train3Speed != targetSpeed);
-        train3AccelTime = millis();
-    }
-}
-
-
-
-void smoothStart(
-    BLERemoteCharacteristic* control,
-    int targetSpeed)
-{
-    if (control == nullptr)
-    {
-        Serial.println("Train not connected!");
-        return;
-    }
-
-    if (control == train1Control)
-    {
-        train1Braking = false;
-        train1TargetSpeed = targetSpeed;
-        train1Accelerating = (train1Speed != targetSpeed);
-        train1AccelTime = millis();
-        
-    }
-    else if (control == train2Control)
-    {
-        train2Braking = false;
-        train2TargetSpeed = targetSpeed;
-        train2Accelerating = (train2Speed != targetSpeed);
-        train1AccelTime = millis();
-        
-    }
-    else if (control == train3Control)
-    {      
-        train3Braking = false;
-        train3TargetSpeed = targetSpeed;
-        train3Accelerating = (train3Speed != targetSpeed);
-        train1AccelTime = millis();
-        
-    }
-}
-
-void updateAcceleration()
-{
-    unsigned long now = millis();
-
-    if (train1Accelerating &&
-        now - train1AccelTime >= ACCEL_INTERVAL)
-    {
-        train1AccelTime = now;
-
-        int speed = train1Speed;
-
-        if (speed < train1TargetSpeed)
-            speed = min(speed + ACCEL_STEP, train1TargetSpeed);
-        else
-            speed = max(speed - ACCEL_STEP, train1TargetSpeed);
-
-        setMotorSpeed(train1Control, speed);
-
-        if (speed == train1TargetSpeed)
-        {
-            train1Accelerating = false;
-            Serial.println("Train 1 reached target power!");
-        }
-    }
-
-    if (train2Accelerating &&
-        now - train2AccelTime >= ACCEL_INTERVAL)
-    {
-        train2AccelTime = now;
-
-        int speed = train2Speed;
-
-        if (speed < train2TargetSpeed)
-            speed = min(speed + ACCEL_STEP, train2TargetSpeed);
-        else
-            speed = max(speed - ACCEL_STEP, train2TargetSpeed);
-
-        setMotorSpeed(train2Control, speed);
-
-        if (speed == train2TargetSpeed)
-        {
-            train2Accelerating = false;
-            Serial.println("Train 2 reached target power!");
-        }
-    }
-    
-if (train3Accelerating &&
-    now - train3AccelTime >= ACCEL_INTERVAL)
-{
-    train3AccelTime = now;
-
-    int speed = train3Speed;
-
-    if (speed < train3TargetSpeed)
-        speed = min(speed + ACCEL_STEP, train3TargetSpeed);
-    else
-        speed = max(speed - ACCEL_STEP, train3TargetSpeed);
-
-    setMotorSpeed(train3Control, speed);
-
-    if (speed == train3TargetSpeed)
-    {
-        train3Accelerating = false;
-        Serial.println("Train 3 reached target power!");
-    }
-}
-
-
-}
-
-
-void updateBraking()
-{
-    unsigned long now = millis();
-
-    if (train1Braking &&
-        now - train1BrakeTime >= BRAKE_INTERVAL)
-    {
-        train1BrakeTime = now;
-
-        int speed = train1Speed;
-
-        if (speed > 0)
-            speed = max(0, speed - BRAKE_STEP);
-        else
-            speed = min(0, speed + BRAKE_STEP);
-
-        setMotorSpeed(train1Control, speed);
-
-        if (speed == 0)
-        {
-            train1Braking = false;
-            motorRunning = false;
-            Serial.println("Train 1 smoothly stopped!");
-        }
-    }
-
-    if (train2Braking &&
-        now - train2BrakeTime >= BRAKE_INTERVAL)
-    {
-        train2BrakeTime = now;
-
-        int speed = train2Speed;
-
-        if (speed > 0)
-            speed = max(0, speed - BRAKE_STEP);
-        else
-            speed = min(0, speed + BRAKE_STEP);
-
-        setMotorSpeed(train2Control, speed);
-
-        if (speed == 0)
-        {
-            train2Braking = false;
-            train2Running = false;
-            Serial.println("Train 2 smoothly stopped!");
-        }
-    }
-    if (train3Braking &&
-    now - train3BrakeTime >= BRAKE_INTERVAL)
-{
-    train3BrakeTime = now;
-
-    int speed = train3Speed;
-
-    if (speed > 0)
-        speed = max(0, speed - BRAKE_STEP);
-    else
-        speed = min(0, speed + BRAKE_STEP);
-
-    setMotorSpeed(train3Control, speed);
-
-    if (speed == 0)
-    {
-        train3Braking = false;
-        train3Running = false;
-        Serial.println("Train 3 smoothly stopped!");
-    }
-}
-}
-
-
-void setLights(
-    BLERemoteCharacteristic* control,
-    uint8_t brightness){
-
-    if (control == nullptr) {
-        Serial.println("Train not connected!");
-        return;
-    }
-
-    uint8_t command[] = {
-        0x08,
-        0x00,
-        0x81,
-        0x01,
-        0x10,
-        0x51,
-        0x00,
-        brightness
-    };
-
-    control->writeValue(
-        command,
-        sizeof(command),
-        false
-    );
-}
-//for tests 
-unsigned long lastDistanceMeasurement = 0;
-const unsigned long DISTANCE_INTERVAL = 100;
-
-void setup()
-{
-    initUltrasonicSensor();
-    initializeAutomaticBraking();
     Serial.begin(115200);
-    delay(2000);
+    unsigned long serialWaitStart = millis();
+    while (!Serial && millis() - serialWaitStart < 5000)
+    {
+        delay(10);
+    }
+
+    Serial.println("Starting setup...");
+}
+
+void InitUltrasonic()
+{
+    if (SENSOR_CONNECTED)
+    {
+        Serial.println("Initializing ultrasonic sensor...");
+        initUltrasonicSensor();
+    }
+    else
+    {
+        Serial.println("Ultrasonic sensor disabled; obstacle checks are bypassed.");
+    }
+
+    Serial.println("Initializing automatic braking...");
+    initializeAutomaticBraking();
+}
+
+void ConnectTrains()
+{
+    Serial.println("Starting LEGO Hub scan...");
     scanLEGOHub();
 
-Serial.println("Connecting Train 1...");
+    for(size_t i = 0; i < trainAmount; i++)
+    {
+        trains[i] = new Train(static_cast<int>(i + 1), MQTT_LOCO_ID[i]);
+        if (trains[i] == nullptr)
+        {
+            Serial.printf("Failed to create Train %u!\n", static_cast<unsigned>(i + 1));
+            continue;
+        }
 
-connectToLEGOHub(
-    "9c:9a:c0:4a:8b:b9",
-    train1Client,
-    train1Control
-);
+        trains[i]->connectToLEGOHub(MacAddresses[i]);
+    }
 
-Serial.println("Connecting Train 2...");
+}
 
-connectToLEGOHub(
-    "9c:9a:c0:33:9f:eb",
-    train2Client,
-    train2Control
-);
-Serial.println("Connecting Train 3...");
+void InitWifi()
+{
+    Serial.println("Starting Wifi...");
 
-connectToLEGOHub(
-    "9c:9a:c0:4b:fd:20",
-    train3Client,
-    train3Control
-);
-    Serial.println("Starting ESP32...");
     int networks = WiFi.scanNetworks();
 
-Serial.println(networks);
-for (int i = 0; i < networks; i++) {
-  Serial.println(WiFi.SSID(i));
-}
+    Serial.println(networks);
+    for (int i = 0; i < networks; i++) 
+    {
+        Serial.println(WiFi.SSID(i));
+    }
     WiFi.begin(ssid, password);
 
     
     unsigned long startTime = millis();
-    while (WiFi.status() != WL_CONNECTED &&
-           millis() - startTime < 10000)
+    while (WiFi.status() != WL_CONNECTED && millis() - startTime < 10000)
     {
         delay(500);
         Serial.print(".");
@@ -532,649 +458,474 @@ for (int i = 0; i < networks; i++) {
     {
         Serial.println("WiFi connection timeout!");
     }
-}
-void loop()
-{
-    if (Serial.available() > 0)
-    {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-        command.toUpperCase();
 
-    
-
-if (command == "START")
-{
-    if (isObstacleDetected(1))
-    {
-        Serial.println("Train 1 START blocked!");
-    }
-    else if (train1Control != nullptr)
-    {
-        smoothStart(train1Control, 30);
-
-        motorRunning = true;
-        motorStopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.println("Train 1 starting!");
-    }
-}
-else if (command == "TRAIN2 START")
-{
-    if (isObstacleDetected(2))
-    {
-        Serial.println("Train 2 START blocked!");
-    }
-    else if (train2Control != nullptr)
-    {
-        smoothStart(train2Control, 20);
-
-        train2Running = true;
-        train2StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.println("Train 2 starting!");
-    }
-}
-else if (command == "TRAIN3 STOP")
-{
-    smoothStop(train3Control);
-
-    Serial.println("Train 3 braking smoothly...");
 }
 
-else if (command == "REVERSE")
+String getMqttAttribute(const String& xml, const char* name)
 {
-     if (isObstacleDetected())
+    const String key = String(" ") + name + "=";
+    int start = xml.indexOf(key);
+    if (start < 0)
     {
-        Serial.println("REVERSE blocked! Obstacle detected.");
+        return "";
     }
-    else
-    Serial.println("Reversing Motor A...");
-    train1Accelerating = false;
-    train1Braking = false;
-    setMotorSpeed(train1Control, 0);
-    motorRunning = false;
 
-    delay(500);
+    start += key.length();
+    const char quote = xml.charAt(start);
+    if (quote != '"' && quote != '\'')
+    {
+        return "";
+    }
 
-    setMotorSpeed(train1Control, -20);
-
-    motorRunning = true;
-    motorStopTime = millis() + MOTOR_TIMEOUT;
-
-    Serial.println("Motor A running REVERSE!");
+    const int end = xml.indexOf(quote, start + 1);
+    return end < 0 ? "" : xml.substring(start + 1, end);
 }
 
-else if (command.startsWith("REVERSE "))
+void onMqttMessage(char* topic, byte* payload, unsigned int length)
 {
-    String value = command.substring(8);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
+    if (!MQTT_COMMANDS_ENABLED)
     {
-        if (isObstacleDetected() && speed > 0)
+        return;
+    }
+
+    String message;
+    message.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i)
+    {
+        message += static_cast<char>(payload[i]);
+    }
+    message.trim();
+
+    if (!message.startsWith("<lc "))
+    {
+        return;
+    }
+
+    const String locoID = getMqttAttribute(message, "id");
+    const String speedText = getMqttAttribute(message, "V");
+    if (speedText.length() == 0)
+    {
+        return;
+    }
+
+    int maxSpeed = getMqttAttribute(message, "V_max").toInt();
+    if (maxSpeed <= 0)
+    {
+        maxSpeed = 100;
+    }
+
+    int speed = constrain(speedText.toInt() * 70 / maxSpeed, 0, 70);
+    if (getMqttAttribute(message, "dir") != "true")
+    {
+        speed = -speed;
+    }
+
+    for (size_t i = 0; i < trainAmount; ++i)
+    {
+        Train* train = trains[i];
+        if (train == nullptr || train->locoID != locoID)
         {
-            Serial.println("REVERSE blocked! Obstacle detected.");
+            continue;
+        }
+
+        Serial.printf("Rocrail: loco=%s speed=%d -> power %d%%\n",
+                      locoID.c_str(), speedText.toInt(), speed);
+        if (speed == 0)
+        {
+            train->smoothStop();
         }
         else
         {
-            train1Braking = false;
-            train1Accelerating = false;
+            train->smoothStart(speed);
+        }
+        return;
+    }
+}
 
-            setMotorSpeed(train1Control, 0);
-            motorRunning = false;
+void serviceMqtt()
+{
+    if (mqtt.connected())
+    {
+        mqtt.loop();
+        return;
+    }
 
-            if (speed > 0)
+    if (wasMqttConnected)
+    {
+        wasMqttConnected = false;
+        for (size_t i = 0; i < trainAmount; ++i)
+        {
+            if (trains[i] != nullptr)
             {
-                delay(500);
+                trains[i]->smoothStop();
+            }
+        }
+        Serial.println("MQTT lost - trains stopping");
+    }
 
-                updateAutomaticBraking();
+    if (millis() - lastMqttTry < 5000)
+    {
+        return;
+    }
+    lastMqttTry = millis();
 
-                if (!isObstacleDetected())
-                {
-                    setMotorSpeed(train1Control, -speed);
-                    motorRunning = true;
-                    motorStopTime = millis() + MOTOR_TIMEOUT;
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        WiFi.reconnect();
+        return;
+    }
 
-                    Serial.printf(
-                        "Train 1 reversing at %d%% power\n",
-                        speed
-                    );
-                }
+    const String clientID = "esp32-train-" + String(static_cast<uint32_t>(ESP.getEfuseMac()), HEX);
+    Serial.printf("Connecting to MQTT %s:%u ... ", MQTT_HOST, MQTT_PORT);
+
+    if (!mqtt.connect(clientID.c_str()))
+    {
+        Serial.printf("failed, rc=%d\n", mqtt.state());
+        return;
+    }
+
+    Serial.println("connected");
+    if (MQTT_COMMANDS_ENABLED && !mqtt.subscribe(MQTT_COMMAND_TOPIC))
+    {
+        Serial.println("Failed to subscribe to Rocrail command topic!");
+    }
+    if (!mqtt.publish("trainbridge/status", "online"))
+    {
+        Serial.println("Failed to publish MQTT online status!");
+    }
+    wasMqttConnected = true;
+}
+
+void setup()
+{
+    InitSerial();
+
+    initUltrasonicSensor();
+
+    ConnectTrains();
+
+    InitWifi();
+
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    if (!mqtt.setBufferSize(4096))
+    {
+        Serial.println("Failed to set MQTT buffer size!");
+    }
+    mqtt.setCallback(onMqttMessage);
+}
+
+
+
+struct ParsedCommand
+{
+    String core;
+    String args;
+};
+
+ParsedCommand parseCommand(const String& input)
+{
+    String text = input;
+    text.trim();
+
+    ParsedCommand result;
+    int separator = text.indexOf(' ');
+
+    if (separator < 0)
+    {
+        result.core = text;
+    }
+    else
+    {
+        result.core = text.substring(0, separator);
+        result.args = text.substring(separator + 1);
+        result.args.trim();
+    }
+
+    result.core.toUpperCase();
+    return result;
+}
+
+bool splitFirstArgument(const String& input, String& first, String& remainder)
+{
+    String text = input;
+    text.trim();
+
+    const int separator = text.indexOf(' ');
+    if (separator <= 0 || separator == static_cast<int>(text.length()) - 1)
+    {
+        return false;
+    }
+
+    first = text.substring(0, separator);
+    first.trim();
+    remainder = text.substring(separator + 1);
+    remainder.trim();
+    return first.length() > 0 && remainder.length() > 0;
+}
+
+bool parseTrainID(const String& target, int& trainID)
+{
+    if (target.length() == 0)
+    {
+        Serial.println("Train target is required.");
+        return false;
+    }
+
+    unsigned int parsedID = 0;
+    for (size_t i = 0; i < target.length(); ++i)
+    {
+        const char digit = target.charAt(i);
+        if (digit < '0' || digit > '9')
+        {
+            Serial.println("Train target must be a train number or ALL.");
+            return false;
+        }
+
+        parsedID = parsedID * 10 + static_cast<unsigned int>(digit - '0');
+        if (parsedID > trainAmount)
+        {
+            break;
+        }
+    }
+
+    if (parsedID < 1 || parsedID > trainAmount)
+    {
+        Serial.printf("Train number must be between 1 and %u!\n", static_cast<unsigned>(trainAmount));
+        return false;
+    }
+
+    trainID = static_cast<int>(parsedID);
+    return true;
+}
+
+Train* getCommandTrain(int trainID)
+{
+    if (trainID < 1 || static_cast<size_t>(trainID) > trainAmount)
+    {
+        return nullptr;
+    }
+
+    Train* train = trains[trainID - 1];
+    if (train == nullptr)
+    {
+        Serial.printf("Train %d is not initialized!\n", trainID);
+        return nullptr;
+    }
+
+    if (train->TrainControl == nullptr || train->TrainClient == nullptr || !train->TrainClient->isConnected())
+    {
+        Serial.printf("Train %d control not available!\n", trainID);
+        return nullptr;
+    }
+
+    return train;
+}
+
+template <typename Action>
+void forEachTargetTrain(const String& requestedTarget, Action action)
+{
+    String target = requestedTarget;
+    target.trim();
+    target.toUpperCase();
+
+    if (target == "ALL")
+    {
+        for (size_t i = 0; i < trainAmount; ++i)
+        {
+            Train* train = getCommandTrain(static_cast<int>(i + 1));
+            if (train != nullptr)
+            {
+                action(*train);
+            }
+        }
+        return;
+    }
+
+    int trainID = 0;
+    if (!parseTrainID(target, trainID))
+    {
+        return;
+    }
+
+    Train* train = getCommandTrain(trainID);
+    if (train != nullptr)
+    {
+        action(*train);
+    }
+}
+
+bool parseBoundedValue(const String& text, int maximum, int& value)
+{
+    if (text.length() == 0 || text.length() > 3)
+    {
+        return false;
+    }
+
+    int parsedValue = 0;
+    for (size_t i = 0; i < text.length(); ++i)
+    {
+        const char digit = text.charAt(i);
+        if (digit < '0' || digit > '9')
+        {
+            return false;
+        }
+
+        parsedValue = parsedValue * 10 + (digit - '0');
+        if (parsedValue > maximum)
+        {
+            return false;
+        }
+    }
+
+    value = parsedValue;
+    return true;
+}
+
+void HandleCommands()
+{
+    if (Serial.available() <= 0)
+    {
+        return;
+    }
+
+    ParsedCommand command = parseCommand(Serial.readStringUntil('\n'));
+    if (command.core.length() == 0)
+    {
+        return;
+    }
+
+    if (command.core == "START")
+    {
+        const String target = command.args.length() == 0 ? "ALL" : command.args;
+
+        forEachTargetTrain(target, [](Train& train)
+        {
+            if (isObstacleDetected(train.trainID))
+            {
+                Serial.printf("Train %d START blocked!\n", train.trainID);
+                return;
+            }
+
+            train.smoothStart(SMOOTH_START_SPEED);
+            Serial.printf("Train %d starting!\n", train.trainID);
+        });
+    }
+    else if (command.core == "STOP")
+    {
+        const String target = command.args.length() == 0 ? "ALL" : command.args;
+        forEachTargetTrain(target, [](Train& train)
+        {
+            train.smoothStop();
+            Serial.printf("Train %d stopping!\n", train.trainID);
+        });
+    }
+    else if (command.core == "SPEED")
+    {
+        String target;
+        String valueText;
+        int speed = 0;
+        if (!splitFirstArgument(command.args, target, valueText) || !parseBoundedValue(valueText, 70, speed))
+        {
+            Serial.println("Usage: SPEED <train number|ALL> <0-70>");
+            return;
+        }
+
+        forEachTargetTrain(target, [speed](Train& train)
+        {
+            if (speed > 0 && isObstacleDetected(train.trainID))
+            {
+                Serial.printf("Train %d SPEED blocked! Obstacle detected.\n", train.trainID);
+                return;
+            }
+
+            train.TrainAccelerating = false;
+            train.TrainBraking = false;
+            train.setMotorSpeed(speed);
+            Serial.printf("Train %d motor power: %d%%\n", train.trainID, speed);
+        });
+    }
+    else if (command.core == "REVERSE")
+    {
+        forEachTargetTrain(command.args, [](Train& train)
+        {
+            if (isObstacleDetected(train.trainID))
+            {
+                Serial.printf("Train %d REVERSE blocked! Obstacle detected.\n", train.trainID);
+                return;
+            }
+
+            train.reverse();
+            Serial.printf("Train %d reversing!\n", train.trainID);
+        });
+    }
+    else if (command.core == "LIGHTS")
+    {
+        String target;
+        String valueText;
+        if (!splitFirstArgument(command.args, target, valueText))
+        {
+            Serial.println("Usage: LIGHTS <train number|ALL> <ON|OFF|0-100>");
+            return;
+        }
+
+        valueText.toUpperCase();
+        int brightness = 0;
+        if (valueText == "ON")
+        {
+            brightness = 100;
+        }
+        else if (valueText == "OFF")
+        {
+            brightness = 0;
+        }
+        else if (!parseBoundedValue(valueText, 100, brightness))
+        {
+            Serial.println("Invalid brightness! Use ON, OFF, or 0-100.");
+            return;
+        }
+
+        forEachTargetTrain(target, [brightness](Train& train)
+        {
+            train.setLights(static_cast<uint8_t>(brightness));
+            Serial.printf("Train %d lights: %d%%\n", train.trainID, brightness);
+        });
+    }
+    else
+    {
+        Serial.printf("Unknown command: %s\n", command.core.c_str());
+    }
+}
+
+void loop()
+{
+    serviceMqtt();
+    HandleCommands();
+
+    if (SENSOR_CONNECTED && millis() - lastDistanceMeasurement >= DISTANCE_INTERVAL)
+    {
+        lastDistanceMeasurement = millis();
+        updateAutomaticBraking(1, measureDistance());
+
+        for (size_t i = 0; i < trainAmount; ++i)
+        {
+            Train* train = trains[i];
+            if (train != nullptr &&
+                isObstacleDetected(train->trainID) &&
+                train->TrainRunning &&
+                !train->TrainBraking)
+            {
+                train->smoothStop();
+                Serial.printf("Train %d - Automatic braking!\n", train->trainID);
             }
         }
     }
-    else
+
+    for (size_t i = 0; i < trainAmount; ++i)
     {
-        Serial.println("Invalid reverse speed! Use 0-60.");
-    }
-}
-
-else if (command == "LIGHTS ON")
-{
-    setLights(train1Control, 100);
-    Serial.println("Lights ON!");
-}
-else if (command == "LIGHTS OFF")
-{
-    setLights(train1Control, 0);
-    Serial.println("Lights OFF!");
-}
-
-else if (command.startsWith("LIGHTS "))
-{
-    String value = command.substring(7);
-    int brightness = value.toInt();
-
-    if (brightness >= 0 && brightness <= 100 &&
-        value.length() > 0 &&
-        value.toInt() == brightness)
-    {
-        setLights(train1Control, brightness);
-        Serial.printf("Lights brightness: %d%%\n", brightness);
-    }
-    else
-    {
-        Serial.println("Invalid brightness! Use 0-100.");
-    }
-}
-else if (command.startsWith("SPEED "))
-{
-    String value = command.substring(6);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
-    {
-         if (isObstacleDetected() && speed > 0)
+        if (trains[i] != nullptr)
         {
-            Serial.println("SPEED blocked! Obstacle detected.");
+            trains[i]->updateAcceleration();
+            trains[i]->updateBraking();
         }
-        else
-        train1Accelerating = false;
-        train1Braking = false;
-
-        setMotorSpeed(train1Control, speed);
-
-        motorRunning = (speed > 0);
-        motorStopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf("Train 1 motor power: %d%%\n", speed);
     }
-    else
-    {
-        Serial.println("Invalid speed! Use 0-60.");
-    }
-}
-// speed for 3 train
-
-else if (command.startsWith("TRAIN3 SPEED "))
-{
-    String value = command.substring(13);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
-    {
-         if (isObstacleDetected(1) && speed > 0)
-        {
-            Serial.println("Train 1 SPEED blocked!");
-        }
-        else
-        train3Accelerating = false;
-        train3Braking = false;
-
-        setMotorSpeed(train3Control, speed);
-
-        train3Running = (speed > 0);
-        train3StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf("Train 3 motor power: %d%%\n", speed);
-    }
-    else
-    {
-        Serial.println("Invalid speed! Use 0-60.");
-    }
-}
-
-else if (command == "STOP")
-{
-     smoothStop(train1Control);
-
-    Serial.println("Train 1 braking smoothly...");
-}
-
-
-else if (command == "TRAIN3 START")
-{
-    if (isObstacleDetected(3))
-    {
-        Serial.println("Train 3 START blocked!");
-    }
-    else if (train3Control != nullptr)
-    {
-        smoothStart(train3Control, 20);
-
-        train3Running = true;
-        train3StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.println("Train 3 starting!");
-    }
-}
-
-
-else if (command.startsWith("TRAIN2 SPEED "))
-{
-    String value = command.substring(13);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
-    {
-         if (isObstacleDetected(1) && speed > 0)
-        {
-            Serial.println("Train 1 SPEED blocked!");
-        }
-        else
-        train2Accelerating = false;
-        train2Braking = false;
-
-        setMotorSpeed(train2Control, speed);
-
-        train2Running = (speed > 0);
-        train2StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf("Train 2 motor power: %d%%\n", speed);
-    }
-    else
-    {
-        Serial.println("Invalid speed! Use 0-60.");
-    }
-}
-
-
-else if (command == "TRAIN2 STOP")
-{
-     smoothStop(train2Control);
-
-    Serial.println("Train 2 braking smoothly...");
-}
-else if (command == "TRAIN2 REVERSE")
-{
-    train2Accelerating = false;
-    train2Braking = false;
-    setMotorSpeed(train2Control, 0);
-    train2Running = false;
-
-    delay(500);
-
-    setMotorSpeed(train2Control, -20);
-
-    train2Running = true;
-    train2StopTime = millis() + MOTOR_TIMEOUT;
-
-    Serial.println("Train 2 REVERSE!");
-}
-
-else if (command == "ALL REVERSE")
-{
-    train1Accelerating = false;
-    train2Accelerating = false;
-    train3Accelerating = false;
-    // Cancel ongoing braking
-    train1Braking = false;
-    train2Braking = false;
-    train3Braking = false;
-
-    // Stop both motors before reversing
-    setMotorSpeed(train1Control, 0);
-    setMotorSpeed(train2Control, 0);
-    setMotorSpeed(train3Control, 0);
-
-
-    delay(500);
-    updateAutomaticBraking();
-    if (!isObstacleDetected())
-    {
-        setMotorSpeed(train1Control, -20);
-
-        motorRunning = true;
-        motorStopTime = millis() + MOTOR_TIMEOUT;
-    }
-    else
-    {
-        Serial.println("Train 1 REVERSE blocked! Obstacle detected.");
-    }
-    // Reverse both trains
-    setMotorSpeed(train1Control, -20);
-    setMotorSpeed(train2Control, -20);
-    setMotorSpeed(train3Control, -20);
-
-    motorRunning = true;
-    train2Running = true;
-    train3Running = true;
-
-    motorStopTime = millis() + MOTOR_TIMEOUT;
-    train2StopTime = millis() + MOTOR_TIMEOUT;
-    train3StopTime = millis() + MOTOR_TIMEOUT;
-
-
-    Serial.println("ALL REVERSE - All trains reversing!");
-}
-else if (command.startsWith("ALL REVERSE "))
-{
-    String value = command.substring(12);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
-    {
-        train1Braking = false;
-        train2Braking = false;
-        train3Braking = false;
-
-        train1Accelerating = false;
-        train2Accelerating = false;
-        train3Accelerating = false;
-
-        setMotorSpeed(train1Control, 0);
-        setMotorSpeed(train2Control, 0);
-        setMotorSpeed(train3Control, 0);
-
-        motorRunning = false;
-        train2Running = false;
-        train3Running = false;
-
-        delay(500);
-        updateAutomaticBraking();
-
-        if (!isObstacleDetected() || speed == 0)
-        {
-            setMotorSpeed(train1Control, -speed);
-
-            motorRunning = (speed != 0);
-            motorStopTime = millis() + MOTOR_TIMEOUT;
-        }
-        else
-        {
-            Serial.println("Train 1 REVERSE blocked! Obstacle detected.");
-        }
-        setMotorSpeed(train1Control, -speed);
-        setMotorSpeed(train2Control, -speed);
-        setMotorSpeed(train3Control, -speed);
-
-        motorRunning = (speed != 0);
-        train2Running = (speed != 0);
-        train3Running = (speed != 0);
-
-        motorStopTime = millis() + MOTOR_TIMEOUT;
-        train2StopTime = millis() + MOTOR_TIMEOUT;
-        train3StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf(
-            "ALL REVERSE - All trains reversing at %d%% power\n",
-            speed
-        );
-    }
-    else
-    {
-        Serial.println("Invalid speed! Use 0-60.");
-    }
-}
-
-
-else if (command == "ALL START")
-{
-    if (!isObstacleDetected(1) && train1Control != nullptr)
-    {
-        smoothStart(train1Control, 30);
-
-        motorRunning = true;
-        motorStopTime = millis() + MOTOR_TIMEOUT;
-    }
-    else
-    {
-        Serial.println("Train 1 START blocked!");
-    }
-
-    if (!isObstacleDetected(2) && train2Control != nullptr)
-    {
-        smoothStart(train2Control, 20);
-
-        train2Running = true;
-        train2StopTime = millis() + MOTOR_TIMEOUT;
-    }
-    else
-    {
-        Serial.println("Train 2 START blocked!");
-    }
-
-    if (!isObstacleDetected(3) && train3Control != nullptr)
-    {
-        smoothStart(train3Control, 20);
-
-        train3Running = true;
-        train3StopTime = millis() + MOTOR_TIMEOUT;
-    }
-    else
-    {
-        Serial.println("Train 3 START blocked!");
-    }
-}
-
-
-else if (command == "ALL STOP")
-{
-    setMotorSpeed(train1Control, 0);
-    setMotorSpeed(train2Control, 0);
-    setMotorSpeed(train3Control, 0);
-
-    motorRunning = false;
-    train2Running = false;
-    train1Accelerating = false;
-
-    train2Accelerating = false;
-    train1Braking = false;
-    train2Braking = false;
-
-    train3Accelerating = false;
-    train3Braking = false;
-    train3Running = false;
-
-    Serial.println("ALL STOP requested!");
-}
-
-
-else if (command.startsWith("TRAIN2 REVERSE "))
-{
-    String value = command.substring(15);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
-    {
-        // Cancel acceleration and braking
-        train2Accelerating = false;
-        train2Braking = false;
-
-        // Stop motor before reversing
-        setMotorSpeed(train2Control, 0);
-        train2Running = false;
-
-        delay(500);
-
-        // Reverse motor
-        setMotorSpeed(train2Control, -speed);
-
-        train2Running = (speed != 0);
-        train2StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf(
-            "Train 2 reversing at %d%% power\n",
-            speed
-        );
-    }
-    else
-    {
-        Serial.println("Invalid reverse speed! Use 0-60.");
-    }
-}
-
-
-else if (command.startsWith("TRAIN3 REVERSE "))
-{
-    String value = command.substring(15);
-    value.trim();
-
-    int speed = value.toInt();
-
-    if (speed >= 0 && speed <= 60 &&
-        value == String(speed))
-    {
-        // Cancel acceleration and braking
-        train3Accelerating = false;
-        train3Braking = false;
-
-        // Stop motor before reversing
-        setMotorSpeed(train3Control, 0);
-        train3Running = false;
-
-        delay(500);
-
-        // Reverse motor
-        setMotorSpeed(train3Control, -speed);
-
-        train3Running = (speed != 0);
-        train3StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf(
-            "Train 3 reversing at %d%% power\n",
-            speed
-        );
-    }
-    else
-    {
-        Serial.println("Invalid reverse speed! Use 0-60.");
-    }
-}
-
-
-else if (command == "ALL SMOOTH STOP")
-{
-    smoothStop(train1Control);
-    smoothStop(train2Control);
-    smoothStop(train3Control);
-
-    Serial.println("All trains braking smoothly!");
-}
-
-
-
-    }
-    
-if (motorRunning &&
-    (long)(millis() - motorStopTime) >= 0)
-{
-    train1Accelerating = false;
-    train1Braking = false;
-
-    setMotorSpeed(train1Control, 0);
-    motorRunning = false;
-
-    Serial.println("Train 1 - Automatic STOP!");
-}
-
-if (train2Running &&
-    (long)(millis() - train2StopTime) >= 0)
-{
-    train2Accelerating = false;
-    train2Braking = false;
-
-    setMotorSpeed(train2Control, 0);
-    train2Running = false;
-
-    Serial.println("Train 2 - Automatic STOP!");
-}
-
-if (train3Running &&
-    (long)(millis() - train3StopTime) >= 0)
-{
-    train3Accelerating = false;
-    train3Braking = false;
-
-    setMotorSpeed(train3Control, 0);
-    train3Running = false;
-
-    Serial.println("Train 3 - Automatic STOP!");
-}
-
-if (millis() - lastDistanceMeasurement >= DISTANCE_INTERVAL)
-{
-    lastDistanceMeasurement = millis();
-
-    // Currently connected sensor
-    updateAutomaticBraking(1, measureDistance());
-
-    // Future sensor measurements:
-    // updateAutomaticBraking(2, distance2);
-    // updateAutomaticBraking(3, distance3);
-
-    // Train 1
-    if (isObstacleDetected(1) &&
-        motorRunning &&
-        !train1Braking)
-    {
-        train1Accelerating = false;
-        smoothStop(train1Control);
-
-        if (train1Speed == 0)
-            motorRunning = false;
-
-        Serial.println("Train 1 - Automatic braking!");
-    }
-
-    // Train 2
-    if (isObstacleDetected(2) &&
-        train2Running &&
-        !train2Braking)
-    {
-        train2Accelerating = false;
-        smoothStop(train2Control);
-
-        if (train2Speed == 0)
-            train2Running = false;
-
-        Serial.println("Train 2 - Automatic braking!");
-    }
-
-    // Train 3
-    if (isObstacleDetected(3) &&
-        train3Running &&
-        !train3Braking)
-    {
-        train3Accelerating = false;
-        smoothStop(train3Control);
-
-        if (train3Speed == 0)
-            train3Running = false;
-
-        Serial.println("Train 3 - Automatic braking!");
-    }
-}
-
-updateBraking();
-updateAcceleration();
 }

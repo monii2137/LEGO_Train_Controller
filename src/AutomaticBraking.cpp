@@ -1,6 +1,8 @@
 #include <Arduino.h>
 #include "AutomaticBraking.h"
 
+const bool SENSOR_CONNECTED = false;
+
 static const int TRAIN_COUNT = 3;
 static const float BRAKING_DISTANCE = 30.0f;
 static const int MAX_FAILED_MEASUREMENTS = 3;
@@ -14,14 +16,14 @@ void initializeAutomaticBraking()
     for (int i = 0; i < TRAIN_COUNT; i++)
     {
         obstacleDetected[i] = false;
-        sensorFault[i] = true;
+        sensorFault[i] = SENSOR_CONNECTED;
         failedMeasurements[i] = 0;
     }
 }
 
 void updateAutomaticBraking(int trainID, float distance)
 {
-    if (trainID < 1 || trainID > TRAIN_COUNT)
+    if (!SENSOR_CONNECTED || trainID < 1 || trainID > TRAIN_COUNT)
         return;
 
     int index = trainID - 1;
@@ -52,6 +54,9 @@ void updateAutomaticBraking(int trainID, float distance)
 
 bool isObstacleDetected(int trainID)
 {
+    if (!SENSOR_CONNECTED)
+        return false;
+
     if (trainID < 1 || trainID > TRAIN_COUNT)
         return true;
 
@@ -61,6 +66,9 @@ bool isObstacleDetected(int trainID)
 
 bool isSensorFault(int trainID)
 {
+    if (!SENSOR_CONNECTED)
+        return false;
+
     if (trainID < 1 || trainID > TRAIN_COUNT)
         return true;
 
