@@ -1,6 +1,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <PubSubClient.h>
 #include "wifi_secrets.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
@@ -18,6 +19,19 @@ const int BRAKE_STEP = 5;
 
 const int SMOOTH_START_SPEED = 30;
 
+constexpr size_t trainAmount = 1; // max 3
+constexpr char* MacAddresses[3] = {"9c:9a:c0:4a:8b:b9", "9c:9a:c0:33:9f:eb","9c:9a:c0:4b:fd:20"};
+
+constexpr char MQTT_HOST[] = "192.168.1.125";
+constexpr uint16_t MQTT_PORT = 1883;
+constexpr char* MQTT_LOCO_ID[3] = {"Train1", "Train2", "Train3"};
+constexpr char MQTT_COMMAND_TOPIC[] = "rocrail/service/command";
+constexpr bool MQTT_COMMANDS_ENABLED = true;
+
+WiFiClient mqttWifiClient;
+PubSubClient mqtt(mqttWifiClient);
+unsigned long lastMqttTry = 0;
+bool wasMqttConnected = false;
 
 //for tests 
 unsigned long lastDistanceMeasurement = 0;
@@ -49,6 +63,7 @@ public:
     BLERemoteCharacteristic* TrainControl = nullptr;
 
     const int trainID = 1;
+    const String locoID = "";
     int TrainSpeed = 0;
     bool TrainRunning = false;
     bool TrainBraking = false;
@@ -58,6 +73,7 @@ public:
     unsigned long TrainAccelTime = 0;
 
     Train(const int ID) : trainID(ID) {}
+    Train(const int ID, const String& loco_id) : trainID(ID), locoID(loco_id) {}
 
     void setMotorSpeed(int8_t speed)
     {
@@ -268,6 +284,8 @@ public:
         TrainAccelTime = 0;
     }
 
+    // -
+
     bool connectToLEGOHub(const char* address)
     {
         if (TrainClient != nullptr && TrainClient->isConnected() && TrainControl != nullptr)
@@ -336,14 +354,9 @@ public:
         return true;
     }
 
-
-
     // -
 };
 
-
-constexpr size_t trainAmount = 1; // max 3
-constexpr char* MacAddresses[3] = {"9c:9a:c0:4a:8b:b9", "9c:9a:c0:33:9f:eb","9c:9a:c0:4b:fd:20"};
 Train* trains[trainAmount] = {};
 
 
@@ -367,8 +380,6 @@ void scanLEGOHub()
 
     scanner->clearResults();
 }
-
-
 
 void InitSerial()
 {
@@ -405,7 +416,7 @@ void ConnectTrains()
 
     for(size_t i = 0; i < trainAmount; i++)
     {
-        trains[i] = new Train(static_cast<int>(i + 1));
+        trains[i] = new Train(static_cast<int>(i + 1), MQTT_LOCO_ID[i]);
         if (trains[i] == nullptr)
         {
             Serial.printf("Failed to create Train %u!\n", static_cast<unsigned>(i + 1));
@@ -450,6 +461,141 @@ void InitWifi()
 
 }
 
+String getMqttAttribute(const String& xml, const char* name)
+{
+    const String key = String(" ") + name + "=";
+    int start = xml.indexOf(key);
+    if (start < 0)
+    {
+        return "";
+    }
+
+    start += key.length();
+    const char quote = xml.charAt(start);
+    if (quote != '"' && quote != '\'')
+    {
+        return "";
+    }
+
+    const int end = xml.indexOf(quote, start + 1);
+    return end < 0 ? "" : xml.substring(start + 1, end);
+}
+
+void onMqttMessage(char* topic, byte* payload, unsigned int length)
+{
+    if (!MQTT_COMMANDS_ENABLED)
+    {
+        return;
+    }
+
+    String message;
+    message.reserve(length + 1);
+    for (unsigned int i = 0; i < length; ++i)
+    {
+        message += static_cast<char>(payload[i]);
+    }
+    message.trim();
+
+    if (!message.startsWith("<lc "))
+    {
+        return;
+    }
+
+    const String locoID = getMqttAttribute(message, "id");
+    const String speedText = getMqttAttribute(message, "V");
+    if (speedText.length() == 0)
+    {
+        return;
+    }
+
+    int maxSpeed = getMqttAttribute(message, "V_max").toInt();
+    if (maxSpeed <= 0)
+    {
+        maxSpeed = 100;
+    }
+
+    int speed = constrain(speedText.toInt() * 70 / maxSpeed, 0, 70);
+    if (getMqttAttribute(message, "dir") != "true")
+    {
+        speed = -speed;
+    }
+
+    for (size_t i = 0; i < trainAmount; ++i)
+    {
+        Train* train = trains[i];
+        if (train == nullptr || train->locoID != locoID)
+        {
+            continue;
+        }
+
+        Serial.printf("Rocrail: loco=%s speed=%d -> power %d%%\n",
+                      locoID.c_str(), speedText.toInt(), speed);
+        if (speed == 0)
+        {
+            train->smoothStop();
+        }
+        else
+        {
+            train->smoothStart(speed);
+        }
+        return;
+    }
+}
+
+void serviceMqtt()
+{
+    if (mqtt.connected())
+    {
+        mqtt.loop();
+        return;
+    }
+
+    if (wasMqttConnected)
+    {
+        wasMqttConnected = false;
+        for (size_t i = 0; i < trainAmount; ++i)
+        {
+            if (trains[i] != nullptr)
+            {
+                trains[i]->smoothStop();
+            }
+        }
+        Serial.println("MQTT lost - trains stopping");
+    }
+
+    if (millis() - lastMqttTry < 5000)
+    {
+        return;
+    }
+    lastMqttTry = millis();
+
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        WiFi.reconnect();
+        return;
+    }
+
+    const String clientID = "esp32-train-" + String(static_cast<uint32_t>(ESP.getEfuseMac()), HEX);
+    Serial.printf("Connecting to MQTT %s:%u ... ", MQTT_HOST, MQTT_PORT);
+
+    if (!mqtt.connect(clientID.c_str()))
+    {
+        Serial.printf("failed, rc=%d\n", mqtt.state());
+        return;
+    }
+
+    Serial.println("connected");
+    if (MQTT_COMMANDS_ENABLED && !mqtt.subscribe(MQTT_COMMAND_TOPIC))
+    {
+        Serial.println("Failed to subscribe to Rocrail command topic!");
+    }
+    if (!mqtt.publish("trainbridge/status", "online"))
+    {
+        Serial.println("Failed to publish MQTT online status!");
+    }
+    wasMqttConnected = true;
+}
+
 void setup()
 {
     InitSerial();
@@ -459,7 +605,16 @@ void setup()
     ConnectTrains();
 
     InitWifi();
+
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    if (!mqtt.setBufferSize(4096))
+    {
+        Serial.println("Failed to set MQTT buffer size!");
+    }
+    mqtt.setCallback(onMqttMessage);
 }
+
+
 
 struct ParsedCommand
 {
@@ -743,6 +898,7 @@ void HandleCommands()
 
 void loop()
 {
+    serviceMqtt();
     HandleCommands();
 
     if (SENSOR_CONNECTED && millis() - lastDistanceMeasurement >= DISTANCE_INTERVAL)
