@@ -266,10 +266,7 @@ void smoothStart(
 }
 
 
-
-void smoothStart(
-    BLERemoteCharacteristic* control,
-    int targetSpeed)
+void smoothStop(BLERemoteCharacteristic* control)
 {
     if (control == nullptr)
     {
@@ -279,29 +276,32 @@ void smoothStart(
 
     if (control == train1Control)
     {
-        train1Braking = false;
-        train1TargetSpeed = targetSpeed;
-        train1Accelerating = (train1Speed != targetSpeed);
-        train1AccelTime = millis();
-        
+        train1Accelerating = false;
+        train1Braking = (train1Speed != 0);
+        train1BrakeTime = millis();
+        if (!train1Braking)
+            motorRunning = false;
     }
     else if (control == train2Control)
     {
-        train2Braking = false;
-        train2TargetSpeed = targetSpeed;
-        train2Accelerating = (train2Speed != targetSpeed);
-        train1AccelTime = millis();
-        
+        train2Accelerating = false;
+        train2Braking = (train2Speed != 0);
+        train2BrakeTime = millis();
+        if (!train2Braking)
+            train2Running = false;
     }
     else if (control == train3Control)
-    {      
-        train3Braking = false;
-        train3TargetSpeed = targetSpeed;
-        train3Accelerating = (train3Speed != targetSpeed);
-        train1AccelTime = millis();
-        
+    {
+        train3Accelerating = false;
+        train3Braking = (train3Speed != 0);
+        train3BrakeTime = millis();
+        if (!train3Braking)
+            train3Running = false;
     }
+    else
+        Serial.println("Unknown train control!");
 }
+
 
 void updateAcceleration()
 {
@@ -477,10 +477,27 @@ const unsigned long DISTANCE_INTERVAL = 100;
 
 void setup()
 {
-    initUltrasonicSensor();
-    initializeAutomaticBraking();
     Serial.begin(115200);
-    delay(2000);
+    unsigned long serialWaitStart = millis();
+    while (!Serial && millis() - serialWaitStart < 5000)
+    {
+        delay(10);
+    }
+
+    Serial.println("Starting setup...");
+    if (SENSOR_CONNECTED)
+    {
+        Serial.println("Initializing ultrasonic sensor...");
+        initUltrasonicSensor();
+    }
+    else
+    {
+        Serial.println("Ultrasonic sensor disabled; obstacle checks are bypassed.");
+    }
+
+    Serial.println("Initializing automatic braking...");
+    initializeAutomaticBraking();
+    Serial.println("Starting LEGO Hub scan...");
     scanLEGOHub();
 
 Serial.println("Connecting Train 1...");
@@ -584,25 +601,27 @@ else if (command == "TRAIN3 STOP")
 
 else if (command == "REVERSE")
 {
-     if (isObstacleDetected())
+    if (isObstacleDetected(1))
     {
         Serial.println("REVERSE blocked! Obstacle detected.");
     }
     else
-    Serial.println("Reversing Motor A...");
-    train1Accelerating = false;
-    train1Braking = false;
-    setMotorSpeed(train1Control, 0);
-    motorRunning = false;
+    {
+        Serial.println("Reversing Motor A...");
+        train1Accelerating = false;
+        train1Braking = false;
+        setMotorSpeed(train1Control, 0);
+        motorRunning = false;
 
-    delay(500);
+        delay(500);
 
-    setMotorSpeed(train1Control, -20);
+        setMotorSpeed(train1Control, -20);
 
-    motorRunning = true;
-    motorStopTime = millis() + MOTOR_TIMEOUT;
+        motorRunning = true;
+        motorStopTime = millis() + MOTOR_TIMEOUT;
 
-    Serial.println("Motor A running REVERSE!");
+        Serial.println("Motor A running REVERSE!");
+    }
 }
 
 else if (command.startsWith("REVERSE "))
@@ -615,7 +634,7 @@ else if (command.startsWith("REVERSE "))
     if (speed >= 0 && speed <= 60 &&
         value == String(speed))
     {
-        if (isObstacleDetected() && speed > 0)
+        if (isObstacleDetected(1) && speed > 0)
         {
             Serial.println("REVERSE blocked! Obstacle detected.");
         }
@@ -631,9 +650,10 @@ else if (command.startsWith("REVERSE "))
             {
                 delay(500);
 
-                updateAutomaticBraking();
+                if (SENSOR_CONNECTED)
+                    updateAutomaticBraking(1, measureDistance());
 
-                if (!isObstacleDetected())
+                if (!isObstacleDetected(1))
                 {
                     setMotorSpeed(train1Control, -speed);
                     motorRunning = true;
@@ -691,20 +711,22 @@ else if (command.startsWith("SPEED "))
     if (speed >= 0 && speed <= 60 &&
         value == String(speed))
     {
-         if (isObstacleDetected() && speed > 0)
+        if (isObstacleDetected(1) && speed > 0)
         {
             Serial.println("SPEED blocked! Obstacle detected.");
         }
         else
-        train1Accelerating = false;
-        train1Braking = false;
+        {
+            train1Accelerating = false;
+            train1Braking = false;
 
-        setMotorSpeed(train1Control, speed);
+            setMotorSpeed(train1Control, speed);
 
-        motorRunning = (speed > 0);
-        motorStopTime = millis() + MOTOR_TIMEOUT;
+            motorRunning = (speed > 0);
+            motorStopTime = millis() + MOTOR_TIMEOUT;
 
-        Serial.printf("Train 1 motor power: %d%%\n", speed);
+            Serial.printf("Train 1 motor power: %d%%\n", speed);
+        }
     }
     else
     {
@@ -723,20 +745,22 @@ else if (command.startsWith("TRAIN3 SPEED "))
     if (speed >= 0 && speed <= 60 &&
         value == String(speed))
     {
-         if (isObstacleDetected(1) && speed > 0)
+        if (isObstacleDetected(3) && speed > 0)
         {
-            Serial.println("Train 1 SPEED blocked!");
+            Serial.println("Train 3 SPEED blocked!");
         }
         else
-        train3Accelerating = false;
-        train3Braking = false;
+        {
+            train3Accelerating = false;
+            train3Braking = false;
 
-        setMotorSpeed(train3Control, speed);
+            setMotorSpeed(train3Control, speed);
 
-        train3Running = (speed > 0);
-        train3StopTime = millis() + MOTOR_TIMEOUT;
+            train3Running = (speed > 0);
+            train3StopTime = millis() + MOTOR_TIMEOUT;
 
-        Serial.printf("Train 3 motor power: %d%%\n", speed);
+            Serial.printf("Train 3 motor power: %d%%\n", speed);
+        }
     }
     else
     {
@@ -780,20 +804,22 @@ else if (command.startsWith("TRAIN2 SPEED "))
     if (speed >= 0 && speed <= 60 &&
         value == String(speed))
     {
-         if (isObstacleDetected(1) && speed > 0)
+        if (isObstacleDetected(2) && speed > 0)
         {
-            Serial.println("Train 1 SPEED blocked!");
+            Serial.println("Train 2 SPEED blocked!");
         }
         else
-        train2Accelerating = false;
-        train2Braking = false;
+        {
+            train2Accelerating = false;
+            train2Braking = false;
 
-        setMotorSpeed(train2Control, speed);
+            setMotorSpeed(train2Control, speed);
 
-        train2Running = (speed > 0);
-        train2StopTime = millis() + MOTOR_TIMEOUT;
+            train2Running = (speed > 0);
+            train2StopTime = millis() + MOTOR_TIMEOUT;
 
-        Serial.printf("Train 2 motor power: %d%%\n", speed);
+            Serial.printf("Train 2 motor power: %d%%\n", speed);
+        }
     }
     else
     {
@@ -842,33 +868,28 @@ else if (command == "ALL REVERSE")
 
 
     delay(500);
-    updateAutomaticBraking();
-    if (!isObstacleDetected())
+    if (SENSOR_CONNECTED)
+        updateAutomaticBraking(1, measureDistance());
+    if (isObstacleDetected(1))
     {
-        setMotorSpeed(train1Control, -20);
-
-        motorRunning = true;
-        motorStopTime = millis() + MOTOR_TIMEOUT;
+        Serial.println("ALL REVERSE blocked! Obstacle detected.");
     }
     else
     {
-        Serial.println("Train 1 REVERSE blocked! Obstacle detected.");
+        setMotorSpeed(train1Control, -20);
+        setMotorSpeed(train2Control, -20);
+        setMotorSpeed(train3Control, -20);
+
+        motorRunning = true;
+        train2Running = true;
+        train3Running = true;
+
+        motorStopTime = millis() + MOTOR_TIMEOUT;
+        train2StopTime = millis() + MOTOR_TIMEOUT;
+        train3StopTime = millis() + MOTOR_TIMEOUT;
+
+        Serial.println("ALL REVERSE - All trains reversing!");
     }
-    // Reverse both trains
-    setMotorSpeed(train1Control, -20);
-    setMotorSpeed(train2Control, -20);
-    setMotorSpeed(train3Control, -20);
-
-    motorRunning = true;
-    train2Running = true;
-    train3Running = true;
-
-    motorStopTime = millis() + MOTOR_TIMEOUT;
-    train2StopTime = millis() + MOTOR_TIMEOUT;
-    train3StopTime = millis() + MOTOR_TIMEOUT;
-
-
-    Serial.println("ALL REVERSE - All trains reversing!");
 }
 else if (command.startsWith("ALL REVERSE "))
 {
@@ -897,35 +918,32 @@ else if (command.startsWith("ALL REVERSE "))
         train3Running = false;
 
         delay(500);
-        updateAutomaticBraking();
+        if (SENSOR_CONNECTED)
+            updateAutomaticBraking(1, measureDistance());
 
-        if (!isObstacleDetected() || speed == 0)
+        if (isObstacleDetected(1) && speed > 0)
         {
-            setMotorSpeed(train1Control, -speed);
-
-            motorRunning = (speed != 0);
-            motorStopTime = millis() + MOTOR_TIMEOUT;
+            Serial.println("ALL REVERSE blocked! Obstacle detected.");
         }
         else
         {
-            Serial.println("Train 1 REVERSE blocked! Obstacle detected.");
+            setMotorSpeed(train1Control, -speed);
+            setMotorSpeed(train2Control, -speed);
+            setMotorSpeed(train3Control, -speed);
+
+            motorRunning = (speed != 0);
+            train2Running = (speed != 0);
+            train3Running = (speed != 0);
+
+            motorStopTime = millis() + MOTOR_TIMEOUT;
+            train2StopTime = millis() + MOTOR_TIMEOUT;
+            train3StopTime = millis() + MOTOR_TIMEOUT;
+
+            Serial.printf(
+                "ALL REVERSE - All trains reversing at %d%% power\n",
+                speed
+            );
         }
-        setMotorSpeed(train1Control, -speed);
-        setMotorSpeed(train2Control, -speed);
-        setMotorSpeed(train3Control, -speed);
-
-        motorRunning = (speed != 0);
-        train2Running = (speed != 0);
-        train3Running = (speed != 0);
-
-        motorStopTime = millis() + MOTOR_TIMEOUT;
-        train2StopTime = millis() + MOTOR_TIMEOUT;
-        train3StopTime = millis() + MOTOR_TIMEOUT;
-
-        Serial.printf(
-            "ALL REVERSE - All trains reversing at %d%% power\n",
-            speed
-        );
     }
     else
     {
@@ -1085,8 +1103,7 @@ else if (command == "ALL SMOOTH STOP")
 
     }
     
-if (motorRunning &&
-    (long)(millis() - motorStopTime) >= 0)
+if (motorRunning && (long)(millis() - motorStopTime) >= 0 && false)
 {
     train1Accelerating = false;
     train1Braking = false;
@@ -1121,7 +1138,8 @@ if (train3Running &&
     Serial.println("Train 3 - Automatic STOP!");
 }
 
-if (millis() - lastDistanceMeasurement >= DISTANCE_INTERVAL)
+if (SENSOR_CONNECTED &&
+    millis() - lastDistanceMeasurement >= DISTANCE_INTERVAL)
 {
     lastDistanceMeasurement = millis();
 

@@ -1,6 +1,8 @@
 #ifndef AUTOMATIC_BRAKING_H
 #define AUTOMATIC_BRAKING_H
 
+extern const bool SENSOR_CONNECTED;
+
 void initializeAutomaticBraking();
 
 void updateAutomaticBraking(int trainID, float distance);
